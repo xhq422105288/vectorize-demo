@@ -1,6 +1,8 @@
 const DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const MAX_BATCH_SIZE = 50;
 const MAX_TOP_K = 20;
+const MAX_VECTOR_LIST_LIMIT = 1000;
+const DEFAULT_VECTOR_LIST_LIMIT = 100;
 
 type JsonValue =
 	| string
@@ -72,6 +74,7 @@ export default {
 						"POST /documents",
 						"POST /documents/batch",
 						"GET /documents?id=doc-id",
+						"GET /documents/ids",
 						"DELETE /documents",
 						"POST /search",
 					],
@@ -92,6 +95,14 @@ export default {
 				const [vector] = await embedTexts(env, [input.text]);
 				const document = toVector(input, vector);
 				const mutation = await env.VECTORIZE.upsert([document]);
+
+				await syncVectorRegistry(env.DB, (db) =>
+					registerVector(db, {
+						id: document.id,
+						namespace: document.namespace,
+						text: input.text,
+					}),
+				);
 
 				return json(
 					{
@@ -120,6 +131,17 @@ export default {
 					mutations.push(mutationSummary(mutation));
 				}
 
+				await syncVectorRegistry(env.DB, (db) =>
+					registerVectors(
+						db,
+						vectors.map((vector) => ({
+							id: vector.id,
+							namespace: vector.namespace,
+							text: typeof vector.metadata?.text === "string" ? vector.metadata.text : "",
+						})),
+					),
+				);
+
 				return json(
 					{
 						ok: true,
@@ -142,9 +164,16 @@ export default {
 				return json({ count: vectors.length, vectors });
 			}
 
+			if (request.method === "GET" && url.pathname === "/documents/ids") {
+				return json(await listVectorIds(env.DB, url));
+			}
+
 			if (request.method === "DELETE" && url.pathname === "/documents") {
 				const input = validateDelete(await readJson(request));
 				const mutation = await env.VECTORIZE.deleteByIds(input.ids);
+
+				await syncVectorRegistry(env.DB, (db) => removeVectors(db, input.ids));
+
 				return json(
 					{
 						ok: true,
@@ -214,6 +243,116 @@ function toVector(input: Required<Pick<DocumentInput, "text">> & DocumentInput, 
 		namespace: input.namespace,
 		metadata,
 	};
+}
+
+async function syncVectorRegistry(db: D1Database, action: (db: D1Database) => Promise<void>): Promise<void> {
+	try {
+		await action(db);
+	} catch (error) {
+		console.error(
+			JSON.stringify({ message: "Failed to sync the vector ID registry", error: String(error) }),
+		);
+	}
+}
+
+async function registerVector(
+	db: D1Database,
+	vector: { id: string; namespace?: string; text: string },
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO vectors (id, namespace, text, created_at) VALUES (?, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET namespace = excluded.namespace, text = excluded.text, created_at = excluded.created_at`,
+		)
+		.bind(vector.id, vector.namespace ?? "", vector.text, Date.now())
+		.run();
+}
+
+async function registerVectors(
+	db: D1Database,
+	vectors: Array<{ id: string; namespace?: string; text: string }>,
+): Promise<void> {
+	await db.batch(
+		vectors.map((vector) =>
+			db
+				.prepare(
+					`INSERT INTO vectors (id, namespace, text, created_at) VALUES (?, ?, ?, ?)
+					 ON CONFLICT(id) DO UPDATE SET namespace = excluded.namespace, text = excluded.text, created_at = excluded.created_at`,
+				)
+				.bind(vector.id, vector.namespace ?? "", vector.text, Date.now()),
+		),
+	);
+}
+
+async function removeVectors(db: D1Database, ids: string[]): Promise<void> {
+	await db.batch(ids.map((id) => db.prepare("DELETE FROM vectors WHERE id = ?").bind(id)));
+}
+
+async function listVectorIds(db: D1Database, url: URL): Promise<unknown> {
+	const namespace = optionalQueryString(url.searchParams.get("namespace"), "namespace");
+	const limit = optionalBoundedInt(
+		url.searchParams.get("limit"),
+		"limit",
+		1,
+		MAX_VECTOR_LIST_LIMIT,
+		DEFAULT_VECTOR_LIST_LIMIT,
+	);
+	const offset = optionalBoundedInt(url.searchParams.get("offset"), "offset", 0, null, 0);
+
+	const where = namespace === undefined ? "" : " WHERE namespace = ?";
+	const params = namespace === undefined ? [] : [namespace];
+	const select = db
+		.prepare(`SELECT id FROM vectors${where} ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?`)
+		.bind(...params, limit, offset)
+		.all<{ id: string }>();
+	const count = db
+		.prepare(`SELECT COUNT(*) AS total FROM vectors${where}`)
+		.bind(...params)
+		.first<{ total: number }>();
+
+	const [rows, totalRow] = await Promise.all([select, count]);
+
+	return {
+		count: rows.results?.length ?? 0,
+		total: totalRow?.total ?? 0,
+		ids: (rows.results ?? []).map((row) => row.id),
+	};
+}
+
+function optionalQueryString(value: string | null, field: string): string | undefined {
+	if (value === null) {
+		return undefined;
+	}
+
+	const trimmed = value.trim();
+	if (trimmed.length === 0) {
+		throw new HttpError(400, `Query parameter ${field} must be a non-empty string when provided.`);
+	}
+
+	return trimmed;
+}
+
+function optionalBoundedInt(
+	value: string | null,
+	field: string,
+	min: number,
+	max: number | null,
+	fallback: number,
+): number {
+	if (value === null) {
+		return fallback;
+	}
+
+	const parsed = Number(value);
+	const valid = Number.isInteger(parsed) && parsed >= min && (max === null || parsed <= max);
+	if (!valid) {
+		throw new HttpError(
+			400,
+			`Query parameter ${field} must be an integer ${max === null ? `greater than or equal to ${min}` : `between ${min} and ${max}`}.`,
+		);
+	}
+
+	return parsed;
 }
 
 async function readJson(request: Request): Promise<unknown> {
@@ -475,6 +614,18 @@ function uiPage(): string {
 	</div>
 
 	<div class="card">
+		<h2><span class="badge get">GET</span> /documents/ids 列出所有向量 ID</h2>
+		<p class="desc">从 D1 登记表返回全部向量 ID，支持 namespace 过滤与分页。</p>
+		<div class="grid">
+			<label>namespace <input id="ids-ns" placeholder="可选"></label>
+			<label>limit <input id="ids-limit" value="100" placeholder="1-1000"></label>
+			<label>offset <input id="ids-offset" value="0" placeholder="0"></label>
+		</div>
+		<div class="row"><button class="secondary" id="btn-ids">列出</button></div>
+		<pre id="out-ids"></pre>
+	</div>
+
+	<div class="card">
 		<h2><span class="badge delete">DELETE</span> /documents 删除</h2>
 		<p class="desc">按 id 删除，最多 1000 个，逗号分隔。</p>
 		<label>ids * <input id="del-ids" placeholder="doc-1, doc-2"></label>
@@ -594,6 +745,17 @@ function uiPage(): string {
 			if (ids.length === 0) { show('out-get', 400, { error: '请输入至少一个 id' }); return; }
 			var qs = ids.map(function (id) { return 'id=' + encodeURIComponent(id); }).join('&');
 			callApi('GET', '/documents?' + qs, null, 'out-get');
+		});
+
+		el('btn-ids').addEventListener('click', function () {
+			var qs = [];
+			var ns = el('ids-ns').value.trim();
+			var limit = el('ids-limit').value.trim();
+			var offset = el('ids-offset').value.trim();
+			if (ns) qs.push('namespace=' + encodeURIComponent(ns));
+			if (limit) qs.push('limit=' + encodeURIComponent(limit));
+			if (offset) qs.push('offset=' + encodeURIComponent(offset));
+			callApi('GET', '/documents/ids' + (qs.length ? '?' + qs.join('&') : ''), null, 'out-ids');
 		});
 
 		el('btn-del').addEventListener('click', function () {

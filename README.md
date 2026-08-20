@@ -9,6 +9,7 @@
 - 单条 / 批量文本入库：自动调用 Workers AI 嵌入模型生成向量，写入 Vectorize 索引
 - 语义搜索：输入查询文本，返回语义最相似的文档（按余弦距离打分）
 - 按 ID 查询 / 删除文档
+- 列出所有向量 ID：Vectorize 绑定不提供枚举方法，本项目用 D1 维护一张 ID 登记表，入库/删除时自动同步，`GET /documents/ids` 读取该表返回全部 ID（支持 namespace 过滤与分页）
 - 支持 namespace（命名空间隔离）与 metadata 元数据过滤
 - 内置 CORS 支持、请求参数校验、统一错误处理
 
@@ -62,6 +63,7 @@ npx wrangler types
 | 绑定 | 说明 |
 |------|------|
 | `VECTORIZE` | Vectorize 索引 `docs-index` |
+| `DB` | D1 数据库 `vectorize-demo-db`，维护向量 ID 登记表 |
 | `AI` | Workers AI 绑定，用于生成嵌入向量 |
 | `EMBEDDING_MODEL` | 嵌入模型（默认 `@cf/baai/bge-base-en-v1.5`） |
 
@@ -71,6 +73,34 @@ npx wrangler types
 
 ```bash
 npx wrangler vectorize create docs-index --preset @cf/baai/bge-base-en-v1.5
+```
+
+### 1.1 查询 Vectorize 索引 ID 列表
+
+列出账号下所有 Vectorize 索引（含 `index_id`、`dimensions`、`metric`）：
+
+```bash
+npx wrangler vectorize list
+```
+
+查看单个索引的详细信息（含其 ID、向量数量）：
+
+```bash
+npx wrangler vectorize get docs-index
+```
+
+注意：`vectorize get` 只返回索引元信息，**不会列出索引内的向量 ID**——Vectorize 没有枚举全部向量的 API。若要查询所有向量 ID，需通过 D1 登记表：
+
+```bash
+npx wrangler d1 execute vectorize-demo-db --remote --command "SELECT id, namespace FROM vectors"
+```
+
+### 2. 创建 D1 数据库并应用迁移
+
+```bash
+npx wrangler d1 create vectorize-demo-db
+# 把返回的 database_id 填进 wrangler.jsonc 的 d1_databases
+npx wrangler d1 migrations apply vectorize-demo-db --remote
 ```
 
 ### 2. 部署 Worker
@@ -178,6 +208,47 @@ curl -X DELETE http://localhost:8787/documents \
   -d '{ "ids": ["doc-1", "doc-2"] }'
 ```
 
+### 6. 列出所有向量 ID
+
+```bash
+curl "http://localhost:8787/documents/ids"
+```
+
+因为 Vectorize 绑定没有枚举方法，本项目在 D1 里维护了一张 `vectors` 登记表：入库（单条/批量）时写入，删除时移除。该接口就是从这张表读取，返回 `{ count, total, ids }`。
+
+可选参数：
+
+- `namespace`：只看某个命名空间
+- `limit`：每页条数，1–1000，默认 100
+- `offset`：分页偏移，默认 0
+
+```bash
+curl "http://localhost:8787/documents/ids?namespace=eng&limit=100&offset=0"
+```
+
+说明：D1 与 Vectorize 是两次独立写入，极端情况下登记表可能与索引不同步（如 D1 写入失败，此时该 ID 不会出现在列表中）。Vectorize 仍是数据唯一出处，登记表只用于枚举。
+
+### 7. 用 wrangler CLI 直接查看索引
+
+D1 登记表只是枚举用的副本，索引里的真实数据直接看 Vectorize 本身，用 wrangler CLI（需先 `wrangler login`）：
+
+```bash
+# 1. 列出所有 ID
+npx wrangler vectorize list-vectors docs-index
+
+# 2. 看某条完整向量（id + 768 维数值 + metadata）
+npx wrangler vectorize get-vectors docs-index --ids doc-1 doc-2
+
+# 3. 索引状态（总数/维度/最近写入）
+npx wrangler vectorize info docs-index
+```
+
+- `list-vectors`：分页枚举索引内的全部向量 ID，支持 `--count`（1–1000）与 `--cursor`（翻页游标，返回的 `nextCursor`）
+- `get-vectors`：按 ID 拉取完整向量（`--ids` 可传多个，空格分隔，形如 `--ids a 'b' 1 '2'`）
+- `info`：查看索引维度、当前向量总数与最近处理到哪条写入
+
+这三条命令读的是 Vectorize 索引本身（真实数据），`list-vectors` 返回的 `totalCount` 才是索引里实际的向量总数，可与 `GET /documents/ids` 的 `total` 对比，用来校验 D1 登记表是否同步。加 `--json` 可输出 JSON 便于脚本处理。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -188,6 +259,7 @@ curl -X DELETE http://localhost:8787/documents \
 | POST | `/documents` | 单条入库 |
 | POST | `/documents/batch` | 批量入库（1–50 条） |
 | GET | `/documents?id=...` | 按 ID 查询 |
+| GET | `/documents/ids` | 列出所有向量 ID（来源于 D1 登记表） |
 | DELETE | `/documents` | 按 ID 删除 |
 | POST | `/search` | 语义搜索 |
 

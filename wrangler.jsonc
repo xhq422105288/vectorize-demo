@@ -8,6 +8,13 @@
   "vars": {
     "EMBEDDING_MODEL": "@cf/baai/bge-base-en-v1.5"
   },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "vectorize-demo-db",
+      "database_id": "28a8fe60-c026-476c-a75e-742437fde9b2"
+    }
+  ],
   "vectorize": [
     {
       "binding": "VECTORIZE",
